@@ -1,9 +1,13 @@
 import os
 import sqlite3
 import asyncio
-from pathlib import Path
+import logging
+
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,483 +15,431 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
 
-
-# ==================================
-# 1. BOT SETTINGS
-# ==================================
+# =====================================
+# ENVIRONMENT VARIABLES
+# =====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-DATABASE_PATH = os.getenv(
-    "DATABASE_PATH",
-    "bot-data/bot.db"
-)
-
-DELETE_AFTER_SECONDS = 30
-
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot-data/bot.db")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable missing!")
+    raise ValueError("BOT_TOKEN Render Environment Variables mein set karein.")
 
-if ADMIN_ID == 0:
-    print("WARNING: ADMIN_ID set nahi hai. Admin commands kaam nahi karengi.")
+if CHANNEL_ID == 0:
+    raise ValueError("CHANNEL_ID Render Environment Variables mein set karein.")
 
+# =====================================
+# LOGGING
+# =====================================
 
-# ==================================
-# 2. DATABASE CONNECTION
-# ==================================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+# =====================================
+# DATABASE
+# =====================================
 
 def get_connection():
+    folder = os.path.dirname(DATABASE_PATH)
 
-    Path(DATABASE_PATH).parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
     return sqlite3.connect(DATABASE_PATH)
 
 
-# ==================================
-# 3. CREATE DATABASE TABLE
-# ==================================
+def create_database():
+    conn = get_connection()
+    cursor = conn.cursor()
 
-def init_database():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            caption TEXT
+        )
+    """)
 
-    with get_connection() as conn:
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS media (
-
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                channel_message_id INTEGER UNIQUE,
-
-                media_type TEXT NOT NULL,
-
-                file_id TEXT NOT NULL,
-
-                caption TEXT
-
-            )
-        """)
-
-    print("Database ready!")
+    conn.commit()
+    conn.close()
 
 
-# ==================================
-# 4. SAVE PHOTO OR VIDEO
-# ==================================
+def save_media(file_id, media_type, caption):
+    conn = get_connection()
+    cursor = conn.cursor()
 
-def save_media(message, media_type, file_id):
+    cursor.execute(
+        """
+        INSERT INTO media (file_id, media_type, caption)
+        VALUES (?, ?, ?)
+        """,
+        (file_id, media_type, caption),
+    )
 
-    with get_connection() as conn:
-
-        conn.execute("""
-            INSERT OR IGNORE INTO media
-
-            (
-                channel_message_id,
-                media_type,
-                file_id,
-                caption
-            )
-
-            VALUES (?, ?, ?, ?)
-
-        """, (
-            message.message_id,
-            media_type,
-            file_id,
-            message.caption
-        ))
+    conn.commit()
+    conn.close()
 
 
-# ==================================
-# 5. GET ALL MEDIA
-# ==================================
+# =====================================
+# ADMIN CHECK
+# =====================================
 
-def get_all_media():
-
-    with get_connection() as conn:
-
-        return conn.execute("""
-            SELECT id, media_type, file_id, caption
-
-            FROM media
-
-            ORDER BY id ASC
-
-        """).fetchall()
+def is_admin(user_id):
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
-# ==================================
-# 6. CHANNEL UPLOAD HANDLER
-# ==================================
+# =====================================
+# AUTO DELETE MESSAGE AFTER 30 SECONDS
+# =====================================
 
-async def channel_media_handler(update, context):
+async def delete_later(bot, chat_id, message_id):
+    await asyncio.sleep(30)
+
+    try:
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except TelegramError as error:
+        logger.warning("Message delete nahi hua: %s", error)
+
+
+# =====================================
+# HEALTH CHECK SERVER FOR RENDER
+# =====================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Telegram Bot is Running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler,
+    )
+
+    logger.info("Health server running on port %s", port)
+
+    server.serve_forever()
+
+
+# =====================================
+# START COMMAND
+# =====================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "Welcome! 👋\n\n"
+        "Video dekhne ke liye /video command bhejein.\n"
+        "Help ke liye /help command bhejein."
+    )
+
+
+# =====================================
+# HELP COMMAND
+# =====================================
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "Bot Commands:\n\n"
+        "/start - Bot start karein\n"
+        "/video - Saved media dekhein\n"
+        "/help - Help message\n\n"
+        "Admin Commands:\n"
+        "/list - Saved media ki list\n"
+        "/delete ID - Ek media delete karein\n"
+        "/deleteall - Saare saved media delete karein"
+    )
+
+
+# =====================================
+# CHANNEL MEDIA SAVE
+# =====================================
+
+async def save_channel_media(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
 
     message = update.channel_post
 
     if not message:
         return
 
+    # Sirf selected channel ka media save hoga
     if message.chat_id != CHANNEL_ID:
         return
 
+    file_id = None
+    media_type = None
+
     if message.photo:
-
-        save_media(
-            message,
-            "photo",
-            message.photo[-1].file_id
-        )
-
-        print("SUCCESS: Photo saved!")
+        file_id = message.photo[-1].file_id
+        media_type = "photo"
 
     elif message.video:
-
-        save_media(
-            message,
-            "video",
-            message.video.file_id
-        )
-
-        print("SUCCESS: Video saved!")
+        file_id = message.video.file_id
+        media_type = "video"
 
     elif message.document:
+        mime_type = message.document.mime_type or ""
 
-        mime = message.document.mime_type or ""
+        if mime_type.startswith("image/"):
+            file_id = message.document.file_id
+            media_type = "document"
 
-        if mime.startswith("image/") or mime.startswith("video/"):
+        elif mime_type.startswith("video/"):
+            file_id = message.document.file_id
+            media_type = "document"
 
-            save_media(
-                message,
-                "document",
-                message.document.file_id
-            )
-
-            print("SUCCESS: Media document saved!")
-
-        else:
-
-            print("Unsupported document type.")
-
-
-# ==================================
-# 7. DELETE SENT MESSAGE AFTER 30 SEC
-# ==================================
-
-async def delete_later(bot, chat_id, message_id):
-
-    await asyncio.sleep(DELETE_AFTER_SECONDS)
-
-    try:
-
-        await bot.delete_message(
-            chat_id=chat_id,
-            message_id=message_id
+    if file_id and media_type:
+        save_media(
+            file_id=file_id,
+            media_type=media_type,
+            caption=message.caption,
         )
 
-        print("Sent media deleted after 30 seconds.")
-
-    except TelegramError as error:
-
-        print("Auto delete error:", error)
+        logger.info("Channel se media save hua: %s", media_type)
 
 
-# ==================================
-# 8. SEND ALL MEDIA
-# ==================================
+# =====================================
+# VIDEO COMMAND
+# =====================================
 
-async def send_all_media(update, context):
+async def video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    chat_id = update.effective_chat.id
+    conn = get_connection()
+    cursor = conn.cursor()
 
-    media_list = get_all_media()
-
-    if not media_list:
-
-        await update.effective_message.reply_text(
-            "Abhi koi saved photo/video nahi hai."
-        )
-
-        return
-
-    await update.effective_message.reply_text(
-        f"Total {len(media_list)} photos/videos bheji ja rahi hain."
+    cursor.execute(
+        "SELECT id, file_id, media_type, caption FROM media ORDER BY id ASC"
     )
 
-    for media_id, media_type, file_id, caption in media_list:
+    media_list = cursor.fetchall()
+    conn.close()
+
+    if not media_list:
+        await update.message.reply_text(
+            "Abhi koi media saved nahi hai."
+        )
+        return
+
+    await update.message.reply_text(
+        f"Total {len(media_list)} media mil gaye. Sending..."
+    )
+
+    for media_id, file_id, media_type, caption in media_list:
 
         try:
+            sent_message = None
 
             if media_type == "photo":
-
-                sent = await context.bot.send_photo(
-                    chat_id=chat_id,
+                sent_message = await update.message.reply_photo(
                     photo=file_id,
-                    caption=caption
+                    caption=caption,
                 )
 
             elif media_type == "video":
-
-                sent = await context.bot.send_video(
-                    chat_id=chat_id,
+                sent_message = await update.message.reply_video(
                     video=file_id,
-                    caption=caption
+                    caption=caption,
                 )
 
-            else:
-
-                sent = await context.bot.send_document(
-                    chat_id=chat_id,
+            elif media_type == "document":
+                sent_message = await update.message.reply_document(
                     document=file_id,
-                    caption=caption
+                    caption=caption,
                 )
 
-            asyncio.create_task(
-                delete_later(
-                    context.bot,
-                    chat_id,
-                    sent.message_id
+            if sent_message:
+                asyncio.create_task(
+                    delete_later(
+                        context.bot,
+                        sent_message.chat_id,
+                        sent_message.message_id,
+                    )
                 )
-            )
-
-            await asyncio.sleep(0.5)
 
         except TelegramError as error:
-
-            print(
-                f"Media ID {media_id} send error:",
-                error
+            logger.warning(
+                "Media ID %s send nahi hua: %s",
+                media_id,
+                error,
             )
 
 
-# ==================================
-# 9. START COMMAND
-# ==================================
+# =====================================
+# LIST COMMAND - ADMIN ONLY
+# =====================================
 
-async def start(update, context):
+async def list_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await send_all_media(update, context)
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Aapko permission nahi hai.")
+        return
 
+    conn = get_connection()
+    cursor = conn.cursor()
 
-# ==================================
-# 10. VIDEO COMMAND
-# ==================================
-
-async def video(update, context):
-
-    await send_all_media(update, context)
-
-
-# ==================================
-# 11. ADMIN CHECK
-# ==================================
-
-def is_admin(update):
-
-    return (
-        ADMIN_ID != 0
-        and update.effective_user
-        and update.effective_user.id == ADMIN_ID
+    cursor.execute(
+        "SELECT id, media_type, caption FROM media ORDER BY id DESC LIMIT 50"
     )
 
-
-# ==================================
-# 12. LIST ALL MEDIA
-# ==================================
-
-async def list_media(update, context):
-
-    if not is_admin(update):
-
-        await update.message.reply_text(
-            "Aapko is command ki permission nahi hai."
-        )
-
-        return
-
-    media_list = get_all_media()
+    media_list = cursor.fetchall()
+    conn.close()
 
     if not media_list:
-
-        await update.message.reply_text(
-            "Database mein koi media nahi hai."
-        )
-
+        await update.message.reply_text("Database mein koi media nahi hai.")
         return
 
-    text = "SAVED PHOTOS AND VIDEOS\n\n"
+    response = "Saved Media List:\n\n"
 
-    for media_id, media_type, file_id, caption in media_list:
+    for media_id, media_type, caption in media_list:
+        caption_text = caption or "No caption"
 
-        item = (
+        response += (
             f"ID: {media_id}\n"
             f"Type: {media_type}\n"
-            f"Caption: {caption or 'No caption'}\n\n"
+            f"Caption: {caption_text[:50]}\n\n"
         )
 
-        if len(text) + len(item) > 3500:
-
-            await update.message.reply_text(text)
-
-            text = ""
-
-        text += item
-
-    if text:
-
-        await update.message.reply_text(text)
+    await update.message.reply_text(response)
 
 
-# ==================================
-# 13. DELETE ONE MEDIA
-# ==================================
+# =====================================
+# DELETE COMMAND - ADMIN ONLY
+# =====================================
 
-async def delete_media(update, context):
+async def delete_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not is_admin(update):
-
-        await update.message.reply_text(
-            "Aapko delete permission nahi hai."
-        )
-
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Aapko permission nahi hai.")
         return
 
     if not context.args:
-
         await update.message.reply_text(
-            "Use: /delete 5\n"
-            "Example: /delete 10"
+            "Use karein: /delete ID\nExample: /delete 5"
         )
-
         return
 
     try:
-
         media_id = int(context.args[0])
-
     except ValueError:
-
-        await update.message.reply_text(
-            "Sahi media ID enter karein."
-        )
-
+        await update.message.reply_text("Sahi media ID enter karein.")
         return
 
-    with get_connection() as conn:
+    conn = get_connection()
+    cursor = conn.cursor()
 
-        cursor = conn.execute(
-            "DELETE FROM media WHERE id = ?",
-            (media_id,)
-        )
+    cursor.execute("DELETE FROM media WHERE id = ?", (media_id,))
 
-    if cursor.rowcount > 0:
+    deleted = cursor.rowcount
 
+    conn.commit()
+    conn.close()
+
+    if deleted:
         await update.message.reply_text(
-            f"Media ID {media_id} database se delete ho gayi."
+            f"Media ID {media_id} database se delete ho gaya."
         )
-
     else:
-
-        await update.message.reply_text(
-            "Ye media ID database mein nahi mili."
-        )
+        await update.message.reply_text("Ye media ID nahi mili.")
 
 
-# ==================================
-# 14. DELETE ALL MEDIA
-# ==================================
+# =====================================
+# DELETE ALL COMMAND - ADMIN ONLY
+# =====================================
 
-async def delete_all_media(update, context):
+async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not is_admin(update):
-
-        await update.message.reply_text(
-            "Aapko permission nahi hai."
-        )
-
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Aapko permission nahi hai.")
         return
 
-    with get_connection() as conn:
+    conn = get_connection()
+    cursor = conn.cursor()
 
-        cursor = conn.execute(
-            "DELETE FROM media"
-        )
+    cursor.execute("DELETE FROM media")
 
-        deleted_count = cursor.rowcount
+    deleted = cursor.rowcount
+
+    conn.commit()
+    conn.close()
 
     await update.message.reply_text(
-        f"Total {deleted_count} media entries delete ho gayi."
+        f"Database se {deleted} media records delete ho gaye."
     )
 
 
-# ==================================
-# 15. MAIN FUNCTION
-# ==================================
+# =====================================
+# MAIN FUNCTION
+# =====================================
 
 def main():
 
-    init_database()
+    create_database()
 
+    # Render Web Service ke liye health server
+    health_thread = Thread(
+        target=run_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
+
+    # Telegram bot application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User commands
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("video", video)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("video", video))
 
     # Admin commands
+    app.add_handler(CommandHandler("list", list_media))
+    app.add_handler(CommandHandler("delete", delete_media))
+    app.add_handler(CommandHandler("deleteall", delete_all))
 
-    app.add_handler(
-        CommandHandler("list", list_media)
-    )
-
-    app.add_handler(
-        CommandHandler("delete", delete_media)
-    )
-
-    app.add_handler(
-        CommandHandler("deleteall", delete_all_media)
-    )
-
-    # Channel photo/video handler
-
+    # Channel media handler
     app.add_handler(
         MessageHandler(
-            filters.ChatType.CHANNEL
-            & (
-                filters.PHOTO
-                | filters.VIDEO
-                | filters.Document.ALL
-            ),
-            channel_media_handler
+            filters.ALL,
+            save_channel_media,
         )
     )
 
-    print("Telegram Bot Running...")
+    logger.info("Telegram Bot start ho raha hai...")
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
 
-# ==================================
-# 16. RUN BOT
-# ==================================
+# =====================================
+# RUN BOT
+# =====================================
 
 if __name__ == "__main__":
-
     main()
